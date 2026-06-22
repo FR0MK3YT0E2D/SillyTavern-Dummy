@@ -1,4 +1,4 @@
-# Dummy（SillyTavern UI 扩展）
+# Dummy（SillyTavern UI 扩展）v1.0.0
 
 让酒馆在 AI 输出为空（或低于最短字符数）时自动重试的小助手。检测到空回后会执行 `/regenerate` 重刷，并设有重试上限，避免无限循环。
 
@@ -47,4 +47,9 @@
 
 ## 授权
 
-AGPL-3.0（与 SillyTavern 生态一致）。
+本项目采用 [MIT License](LICENSE.md)（MIT）。
+
+- 可自由使用、修改、再发布（含商用），无需开源你的改动
+- 惟须保留原作者版权声明与许可全文
+- **当前版本**：1.0.0
+- **版权**：Copyright (c) 2026 FR0MK3YT0E2D
