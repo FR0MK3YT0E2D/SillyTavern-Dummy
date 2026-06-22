@@ -1,55 +1,47 @@
-# Dummy（SillyTavern UI 扩展）v1.0.0
+# Dummy（SillyTavern UI 扩展）v1.1.0
 
-让酒馆在 AI 输出为空（或低于最短字符数）时自动重试的小助手。检测到空回后会执行 `/regenerate` 重刷，并设有重试上限，避免无限循环。
+让酒馆在 AI **输出为空**时自动 `/regenerate` 重刷，在 **回复被截断**（未正常结束）时自动 `/continue` 续写。
 
 ## 一键安装（推荐）
 
 **前提**：运行酒馆的那台电脑需已安装 [Git](https://git-scm.com/downloads)。
 
 1. 打开 SillyTavern → **Extensions（立方体）**
-2. 点击 **Install extension**（云端下载图标）
-3. 粘贴扩展的 **Git 仓库地址**：
+2. 点击 **Install extension**
+3. 粘贴仓库地址：
    ```
    https://github.com/FR0MK3YT0E2D/SillyTavern-Dummy
    ```
-4. 点击 **Save**，等待安装完成
-5. **Manage extensions** → 勾选启用 **Dummy**
-6. 刷新页面（若未自动加载）
+4. **Save** → **Manage extensions** 勾选 **Dummy** → 刷新页面
 
-之后可在 Extensions 抽屉调整重试次数、延迟等设置。
+## 功能
 
-## 手动安装
+### 空回自动重刷
 
-1. 复制本文件夹到：
+角色回复空白（或低于最短字符数）→ 自动 `/regenerate`。
 
-   ```
-   public/scripts/extensions/third-party/SillyTavern-Dummy/
-   ```
+### 截断自动续写（v1.1.0）
 
-   或（仅当前用户）：
+在生成结束后检测是否被截断，自动 `/continue`：
 
-   ```
-   data/default-user/extensions/SillyTavern-Dummy/
-   ```
+| 检测方式 | 说明 |
+|----------|------|
+| **API finish_reason** | 拦截生成请求响应，识别 `length`、`max_tokens`、`content_filter`、`SAFETY` 等（OpenAI 兼容 / Gemini 等） |
+| **未正常收束** | 回复较长但以逗号、未闭合标签等结尾，启发式判定为写到一半 |
+| **续写无增量** | `/continue` 后字数没增加，会继续尝试（直到达上限） |
 
-2. 刷新 → **Manage extensions** → 勾选启用 Dummy。
+均有独立重试上限，避免死循环。
 
 ## 使用
 
-1. 在 **Extensions 抽屉** 右侧展开 **Dummy — 空回自动重刷**。
-2. 确认「启用空回自动重刷」已勾选。
-3. 可调：**最多重试次数**、**解锁后缓冲**（默认 100 ms）、**额外延迟**、**最短有效字符数**。
+Extensions 抽屉 → **Dummy — 空回重刷 / 截断续写**，按需开关与调参。
 
 ## 注意
 
-- 只检查**角色消息**；连续空回达上限会停止并可选 toastr 提示。
-- 纯 API 连接失败、未建立楼层的情况，本扩展无法处理（需另行处理网络 / fetch 重试）。
+- 流式与非流式生成均会尝试读取 API 元数据；部分后端不返回 `finish_reason` 时，仍可依「未收束」启发式判断。
+- 纯连接失败、未建立楼层时本扩展无法处理。
+- 群聊暂未专门优化。
 
 ## 授权
 
-本项目采用 [MIT License](LICENSE.md)（MIT）。
-
-- 可自由使用、修改、再发布（含商用），无需开源你的改动
-- 惟须保留原作者版权声明与许可全文
-- **当前版本**：1.0.0
-- **版权**：Copyright (c) 2026 FR0MK3YT0E2D
+[MIT License](LICENSE.md) · Copyright (c) 2026 FR0MK3YT0E2D

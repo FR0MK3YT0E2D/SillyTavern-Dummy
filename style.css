@@ -33,3 +33,9 @@
 .dummy-scope .dummy-drawer .inline-drawer-content {
     padding: 10px 0 6px;
 }
+
+.dummy-scope hr {
+    border: none;
+    border-top: 1px solid var(--SmartThemeBorderColor, rgba(128, 128, 128, 0.35));
+    margin: 12px 0;
+}

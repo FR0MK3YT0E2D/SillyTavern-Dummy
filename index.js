@@ -1,3 +1,9 @@
+import {
+    clearLastGenerationMeta,
+    getLastGenerationMeta,
+    installGenerationHook,
+} from './generation-hook.js';
+
 const MODULE_NAME = 'Dummy';
 
 const defaultSettings = Object.freeze({
@@ -8,12 +14,25 @@ const defaultSettings = Object.freeze({
     minChars: 1,
     showToast: true,
     stripHtml: true,
+    continueEnabled: true,
+    maxContinueRetries: 5,
+    continueDelayMs: 800,
+    minCharsToContinue: 8,
+    continueOnLength: true,
+    continueOnContentFilter: true,
+    continueOnIncomplete: true,
+    minIncompleteChars: 40,
 });
 
 /** @type {number} */
 let consecutiveRetries = 0;
+/** @type {number} */
+let consecutiveContinueRetries = 0;
 let retryInFlight = false;
 let listenersBound = false;
+
+/** @type {{ type: 'regenerate' | 'continue', baselineLength: number, messageIndex: number } | null} */
+let pendingAction = null;
 
 function getContext() {
     return globalThis.SillyTavern?.getContext?.();
@@ -50,7 +69,6 @@ function delay(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/** 等酒馆把 is_send_press / generating 状态清掉（MESSAGE_RECEIVED 常比解锁更早） */
 async function waitForGenerationUnlock(timeoutMs = 10000, intervalMs = 50) {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
@@ -91,55 +109,183 @@ function notify(settings, message, severity = 'warning') {
 }
 
 function updateStatus(text) {
-    const el = document.getElementById('dummy_status');
-    if (el) el.textContent = text;
+    const statusEl = document.getElementById('dummy_status');
+    if (statusEl) statusEl.textContent = text;
+}
+
+/**
+ * @param {string | null | undefined} reason
+ * @param {ReturnType<typeof getSettings>['settings']} settings
+ */
+function isTruncatedFinishReason(reason, settings) {
+    if (!reason) return false;
+    const r = String(reason).toLowerCase();
+    if (settings.continueOnLength && (r === 'length' || r === 'max_tokens' || r.includes('max_tokens'))) {
+        return true;
+    }
+    if (
+        settings.continueOnContentFilter
+        && (r.includes('content_filter')
+            || r.includes('content')
+            || r.includes('filter')
+            || r.includes('safety')
+            || r.includes('prohibited')
+            || r.includes('recitation'))
+    ) {
+        return true;
+    }
+    return false;
+}
+
+/**
+ * @param {string} text
+ * @param {number} minLen
+ */
+function looksIncomplete(text, minLen) {
+    const t = text.trim();
+    if (t.length < minLen) return false;
+    if (/[。！？…~」』】）)\]"'》〉]\s*$/u.test(t)) return false;
+    if (/<\/\w+>\s*$/.test(t)) return false;
+    if (/<[^/>][^>]*$/.test(t)) return true;
+    if (/[，、：:；;,\-—]\s*$/.test(t)) return true;
+    return true;
+}
+
+/**
+ * @param {string} text
+ * @param {ReturnType<typeof getSettings>['settings']} settings
+ */
+function isTruncatedResponse(text, settings) {
+    const meta = getLastGenerationMeta();
+    if (meta?.finishReason && isTruncatedFinishReason(meta.finishReason, settings)) {
+        return { truncated: true, reason: `API:${meta.finishReason}` };
+    }
+    if (settings.continueOnIncomplete && looksIncomplete(text, settings.minIncompleteChars)) {
+        return { truncated: true, reason: 'incomplete-ending' };
+    }
+    return { truncated: false, reason: '' };
+}
+
+function resetCounters() {
+    consecutiveRetries = 0;
+    consecutiveContinueRetries = 0;
+    pendingAction = null;
+}
+
+async function runSlash(context, command, settings, settleMs, extraMs) {
+    await waitForGenerationUnlock();
+    await delay(settleMs);
+    if (extraMs > 0) await delay(extraMs);
+    if (!settings.enabled && command.includes('regenerate')) return;
+    if (!settings.continueEnabled && command.includes('continue')) return;
+    await context.executeSlashCommandsWithOptions(command, { forceChatTrigger: false });
 }
 
 async function onGenerationEnded() {
     const context = getContext();
     if (!context) return;
-
-    const { settings } = getSettings(context);
-    if (!settings.enabled) return;
     if (retryInFlight) return;
 
+    const { settings } = getSettings(context);
     const last = getLastCharacterMessage(context.chat);
     if (!last) return;
 
     const text = getMessageText(last.message, settings);
-    if (text.length >= settings.minChars) {
-        consecutiveRetries = 0;
+    const settleMs = Math.max(0, Number(settings.unlockSettleMs) || 0);
+
+    if (pendingAction && pendingAction.messageIndex === last.index) {
+        const grew = text.length > pendingAction.baselineLength;
+        if (grew && text.length >= settings.minChars) {
+            const stillTruncated = isTruncatedResponse(text, settings);
+            if (!stillTruncated.truncated) {
+                resetCounters();
+                updateStatus('就绪');
+                return;
+            }
+        }
+    }
+
+    if (text.length < settings.minChars) {
+        consecutiveContinueRetries = 0;
+        if (!settings.enabled) return;
+
+        if (consecutiveRetries >= settings.maxRetries) {
+            notify(settings, `空回已达重试上限（${settings.maxRetries} 次），请手动重刷或检查 API。`);
+            updateStatus(`已停止：连续空回 ${settings.maxRetries} 次`);
+            consecutiveRetries = 0;
+            pendingAction = null;
+            return;
+        }
+
+        retryInFlight = true;
+        consecutiveRetries += 1;
+        const attempt = consecutiveRetries;
+        const extraMs = Math.max(0, Number(settings.delayMs) || 0);
+        updateStatus(`检测到空回，解锁后 ${settleMs + extraMs}ms 自动重刷（${attempt}/${settings.maxRetries}）…`);
+        pendingAction = { type: 'regenerate', baselineLength: text.length, messageIndex: last.index };
+
+        try {
+            await runSlash(context, '/regenerate await=true', settings, settleMs, extraMs);
+        } catch (err) {
+            console.error(`[${MODULE_NAME}] regenerate failed`, err);
+            notify(settings, `自动重刷失败：${err?.message || err}`, 'error');
+            updateStatus(`错误：${err?.message || err}`);
+            resetCounters();
+        } finally {
+            retryInFlight = false;
+        }
+        return;
+    }
+
+    consecutiveRetries = 0;
+
+    if (!settings.continueEnabled) {
         updateStatus('就绪');
         return;
     }
 
-    if (consecutiveRetries >= settings.maxRetries) {
-        notify(settings, `空回已达重试上限（${settings.maxRetries} 次），请手动重刷或检查 API。`);
-        updateStatus(`已停止：连续空回 ${settings.maxRetries} 次`);
-        consecutiveRetries = 0;
+    const { truncated, reason } = isTruncatedResponse(text, settings);
+    const stalledContinue = pendingAction?.type === 'continue'
+        && pendingAction.messageIndex === last.index
+        && text.length <= pendingAction.baselineLength;
+
+    if (!truncated && !stalledContinue) {
+        consecutiveContinueRetries = 0;
+        pendingAction = null;
+        updateStatus('就绪');
+        return;
+    }
+
+    if (text.length < settings.minCharsToContinue && !stalledContinue) {
+        updateStatus('就绪');
+        return;
+    }
+
+    if (consecutiveContinueRetries >= settings.maxContinueRetries) {
+        notify(settings, `截断续写已达上限（${settings.maxContinueRetries} 次），请手动 /continue 或检查 API。`);
+        updateStatus(`已停止：截断续写 ${settings.maxContinueRetries} 次`);
+        consecutiveContinueRetries = 0;
+        pendingAction = null;
         return;
     }
 
     retryInFlight = true;
-    consecutiveRetries += 1;
-    const attempt = consecutiveRetries;
-    const settleMs = Math.max(0, Number(settings.unlockSettleMs) || 0);
-    const extraMs = Math.max(0, Number(settings.delayMs) || 0);
-    updateStatus(`检测到空回，解锁后 ${settleMs + extraMs}ms 自动重刷（${attempt}/${settings.maxRetries}）…`);
-    console.info(`[${MODULE_NAME}] Empty reply at #${last.index}, retry ${attempt}/${settings.maxRetries}`);
+    consecutiveContinueRetries += 1;
+    const attempt = consecutiveContinueRetries;
+    const extraMs = Math.max(0, Number(settings.continueDelayMs) || 0);
+    const label = stalledContinue ? '续写无增量' : (reason || '截断');
+    updateStatus(`检测到${label}，解锁后 ${settleMs + extraMs}ms 自动 /continue（${attempt}/${settings.maxContinueRetries}）…`);
+    console.info(`[${MODULE_NAME}] Truncated at #${last.index} (${label}), continue ${attempt}/${settings.maxContinueRetries}`);
+
+    pendingAction = { type: 'continue', baselineLength: text.length, messageIndex: last.index };
 
     try {
-        await waitForGenerationUnlock();
-        await delay(settleMs);
-        if (extraMs > 0) await delay(extraMs);
-        if (!settings.enabled) return;
-
-        await context.executeSlashCommandsWithOptions('/regenerate await=true', { forceChatTrigger: false });
+        await runSlash(context, '/continue await=true', settings, settleMs, extraMs);
     } catch (err) {
-        console.error(`[${MODULE_NAME}] regenerate failed`, err);
-        notify(settings, `自动重刷失败：${err?.message || err}`, 'error');
+        console.error(`[${MODULE_NAME}] continue failed`, err);
+        notify(settings, `自动续写失败：${err?.message || err}`, 'error');
         updateStatus(`错误：${err?.message || err}`);
-        consecutiveRetries = 0;
+        resetCounters();
     } finally {
         retryInFlight = false;
     }
@@ -150,12 +296,15 @@ function bindListeners() {
     const context = getContext();
     if (!context?.eventSource || !context?.eventTypes) return;
 
+    installGenerationHook();
+
     const { eventSource, eventTypes } = context;
 
     eventSource.on(eventTypes.GENERATION_ENDED, onGenerationEnded);
     eventSource.on(eventTypes.CHAT_CHANGED, () => {
-        consecutiveRetries = 0;
+        resetCounters();
         retryInFlight = false;
+        clearLastGenerationMeta();
         updateStatus('就绪');
     });
 
@@ -175,6 +324,18 @@ function labeledNumber(label, id, initial, min, max, onChange) {
     return el('div', { class: 'dummy-field' }, [el('label', { text: label }), input]);
 }
 
+function labeledCheck(label, checked, onChange) {
+    return el('label', { class: 'dummy-check' }, [
+        (() => {
+            const c = el('input', { type: 'checkbox' });
+            c.checked = checked;
+            c.addEventListener('change', () => onChange(c.checked));
+            return c;
+        })(),
+        el('span', { text: label }),
+    ]);
+}
+
 async function mountUI() {
     const context = getContext();
     if (!context) {
@@ -192,72 +353,85 @@ async function mountUI() {
     }
     if (document.getElementById('dummy_root')) return;
 
+    const save = () => saveSettingsDebounced();
+
     const wrap = el('div', { id: 'dummy_root', class: 'dummy-scope' });
     wrap.appendChild(
         el('div', { class: 'inline-drawer dummy-drawer' }, [
             el('div', { class: 'inline-drawer-toggle inline-drawer-header' }, [
-                el('b', { text: 'Dummy — 空回自动重刷' }),
+                el('b', { text: 'Dummy — 空回重刷 / 截断续写' }),
                 el('div', { class: 'inline-drawer-icon fa-solid fa-circle-chevron-down down' }),
             ]),
             el('div', { class: 'inline-drawer-content' }, [
                 el('p', {
                     class: 'dummy-hint',
-                    text: '当 AI 回复为空白（或低于最短字符数）时，自动执行 /regenerate 重刷。设有重试上限，避免无限循环。仅处理角色消息，不影响用户或系统消息。',
+                    text: '空回时自动 /regenerate；检测到 API 截断（如 length、content_filter）或回复未正常收束时自动 /continue。续写无增量时会继续尝试，均有次数上限。',
                 }),
-                el('label', { class: 'dummy-check' }, [
-                    (() => {
-                        const c = el('input', { type: 'checkbox' });
-                        c.checked = settings.enabled;
-                        c.addEventListener('change', () => {
-                            settings.enabled = c.checked;
-                            saveSettingsDebounced();
-                        });
-                        return c;
-                    })(),
-                    el('span', { text: '启用空回自动重刷' }),
-                ]),
+                labeledCheck('启用空回自动重刷', settings.enabled, (v) => {
+                    settings.enabled = v;
+                    save();
+                }),
                 el('div', { class: 'dummy-grid' }, [
-                    labeledNumber('最多重试次数', 'dummy_max', settings.maxRetries, 1, 10, (v) => {
+                    labeledNumber('空回最多重试', 'dummy_max', settings.maxRetries, 1, 10, (v) => {
                         settings.maxRetries = v;
-                        saveSettingsDebounced();
+                        save();
                     }),
                     labeledNumber('解锁后缓冲（毫秒）', 'dummy_settle', settings.unlockSettleMs, 0, 5000, (v) => {
                         settings.unlockSettleMs = v;
-                        saveSettingsDebounced();
+                        save();
                     }),
-                    labeledNumber('额外延迟（毫秒）', 'dummy_delay', settings.delayMs, 0, 30000, (v) => {
+                    labeledNumber('空回额外延迟（毫秒）', 'dummy_delay', settings.delayMs, 0, 30000, (v) => {
                         settings.delayMs = v;
-                        saveSettingsDebounced();
+                        save();
                     }),
                     labeledNumber('最短有效字符数', 'dummy_min', settings.minChars, 1, 500, (v) => {
                         settings.minChars = v;
-                        saveSettingsDebounced();
+                        save();
                     }),
                 ]),
-                el('label', { class: 'dummy-check' }, [
-                    (() => {
-                        const c = el('input', { type: 'checkbox' });
-                        c.checked = settings.showToast;
-                        c.addEventListener('change', () => {
-                            settings.showToast = c.checked;
-                            saveSettingsDebounced();
-                        });
-                        return c;
-                    })(),
-                    el('span', { text: '达上限时显示提示（toastr）' }),
+                el('hr'),
+                labeledCheck('启用截断自动续写', settings.continueEnabled, (v) => {
+                    settings.continueEnabled = v;
+                    save();
+                }),
+                el('div', { class: 'dummy-grid' }, [
+                    labeledNumber('截断最多续写', 'dummy_cmax', settings.maxContinueRetries, 1, 15, (v) => {
+                        settings.maxContinueRetries = v;
+                        save();
+                    }),
+                    labeledNumber('续写前延迟（毫秒）', 'dummy_cdelay', settings.continueDelayMs, 0, 30000, (v) => {
+                        settings.continueDelayMs = v;
+                        save();
+                    }),
+                    labeledNumber('续写最短已有字数', 'dummy_cmin', settings.minCharsToContinue, 1, 500, (v) => {
+                        settings.minCharsToContinue = v;
+                        save();
+                    }),
+                    labeledNumber('启发式最短字数', 'dummy_imin', settings.minIncompleteChars, 10, 2000, (v) => {
+                        settings.minIncompleteChars = v;
+                        save();
+                    }),
                 ]),
-                el('label', { class: 'dummy-check' }, [
-                    (() => {
-                        const c = el('input', { type: 'checkbox' });
-                        c.checked = settings.stripHtml;
-                        c.addEventListener('change', () => {
-                            settings.stripHtml = c.checked;
-                            saveSettingsDebounced();
-                        });
-                        return c;
-                    })(),
-                    el('span', { text: '判断前剥除 HTML 标签（仅余空白视为空回）' }),
-                ]),
+                labeledCheck('API finish_reason = length / max_tokens 时续写', settings.continueOnLength, (v) => {
+                    settings.continueOnLength = v;
+                    save();
+                }),
+                labeledCheck('API 内容审查 / safety 截断时续写', settings.continueOnContentFilter, (v) => {
+                    settings.continueOnContentFilter = v;
+                    save();
+                }),
+                labeledCheck('回复未正常收束（缺句号等）时续写', settings.continueOnIncomplete, (v) => {
+                    settings.continueOnIncomplete = v;
+                    save();
+                }),
+                labeledCheck('达上限时显示提示（toastr）', settings.showToast, (v) => {
+                    settings.showToast = v;
+                    save();
+                }),
+                labeledCheck('判断前剥除 HTML 标签', settings.stripHtml, (v) => {
+                    settings.stripHtml = v;
+                    save();
+                }),
                 el('div', { class: 'dummy-status', id: 'dummy_status', text: '就绪' }),
             ]),
         ]),
