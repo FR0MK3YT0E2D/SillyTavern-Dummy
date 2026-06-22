@@ -66,7 +66,7 @@ function el(tag, attrs = {}, children = []) {
         if (k === 'class') n.className = v;
         else if (k === 'text') n.textContent = v;
         else if (k.startsWith('on') && typeof v === 'function') n.addEventListener(k.slice(2).toLowerCase(), v);
-        else n.setAttribute(k, v);
+        else if (v !== undefined && v !== null) n.setAttribute(k, v);
     }
     for (const c of children) {
         if (typeof c === 'string') n.appendChild(document.createTextNode(c));
@@ -124,8 +124,13 @@ function updateStatus(text) {
 }
 
 function updateUpdateStatus(text) {
-    const el = document.getElementById('dummy_update_status');
-    if (el) el.textContent = text;
+    const statusEl = document.getElementById('dummy_update_status');
+    if (!statusEl) return;
+    statusEl.textContent = text;
+    statusEl.classList.remove('is-ok', 'is-warn', 'is-busy');
+    if (/正在|检查/.test(text)) statusEl.classList.add('is-busy');
+    else if (/已是最新|已更新/.test(text)) statusEl.classList.add('is-ok');
+    else if (/发现|失败|等待/.test(text)) statusEl.classList.add('is-warn');
 }
 
 /**
@@ -326,7 +331,7 @@ function bindListeners() {
     listenersBound = true;
 }
 
-function labeledNumber(label, id, initial, min, max, onChange) {
+function labeledNumber(label, id, initial, min, max, onChange, hint = '') {
     const input = el('input', { type: 'number', class: 'text_pole wide30px', id, min: String(min), max: String(max) });
     input.value = String(initial);
     input.addEventListener('change', () => {
@@ -336,11 +341,15 @@ function labeledNumber(label, id, initial, min, max, onChange) {
         input.value = String(v);
         onChange(v);
     });
-    return el('div', { class: 'dummy-field' }, [el('label', { text: label }), input]);
+    const labelRow = el('label', {}, [document.createTextNode(label)]);
+    if (hint) {
+        labelRow.appendChild(el('span', { class: 'dummy-hint-icon fa-solid fa-circle-info', title: hint }));
+    }
+    return el('div', { class: 'dummy-field' }, [labelRow, input]);
 }
 
-function labeledCheck(label, checked, onChange) {
-    return el('label', { class: 'dummy-check' }, [
+function labeledCheck(label, checked, onChange, hint = '') {
+    const children = [
         (() => {
             const c = el('input', { type: 'checkbox' });
             c.checked = checked;
@@ -348,7 +357,81 @@ function labeledCheck(label, checked, onChange) {
             return c;
         })(),
         el('span', { text: label }),
+    ];
+    if (hint) {
+        children.push(el('span', { class: 'dummy-hint-icon fa-solid fa-circle-info', title: hint }));
+    }
+    return el('label', { class: 'dummy-check' }, children);
+}
+
+function sectionCard(title, iconClass, children) {
+    return el('div', { class: 'dummy-card' }, [
+        el('div', { class: 'dummy-card-head' }, [
+            el('i', { class: `dummy-card-icon fa-solid ${iconClass}` }),
+            el('span', { class: 'dummy-card-title', text: title }),
+        ]),
+        el('div', { class: 'dummy-card-body' }, children),
     ]);
+}
+
+function featureToggleCard(iconClass, title, subtitle, checked, onChange) {
+    const checkbox = el('input', { type: 'checkbox' });
+    checkbox.checked = checked;
+    checkbox.addEventListener('change', () => onChange(checkbox.checked));
+
+    return el('div', { class: 'dummy-feature-card' }, [
+        el('i', { class: `dummy-feature-icon fa-solid ${iconClass}` }),
+        el('div', { class: 'dummy-feature-text' }, [
+            el('div', { class: 'dummy-feature-title', text: title }),
+            el('div', { class: 'dummy-feature-sub', text: subtitle }),
+        ]),
+        el('label', { class: 'dummy-switch', title: checked ? '已启用' : '已关闭' }, [checkbox, el('span', { class: 'dummy-switch-track' })]),
+    ]);
+}
+
+function tabBar(tabs) {
+    return el('div', { class: 'dummy-tabs', role: 'tablist' }, tabs.map(({ id, label, icon }) => {
+        const btn = el('button', {
+            class: `dummy-tab${id === 'overview' ? ' active' : ''}`,
+            type: 'button',
+            role: 'tab',
+            'data-tab': id,
+            'aria-selected': id === 'overview' ? 'true' : 'false',
+        });
+        btn.appendChild(el('i', { class: `fa-solid ${icon}` }));
+        btn.appendChild(document.createTextNode(label));
+        return btn;
+    }));
+}
+
+function tabPanel(id, active, children) {
+    return el('div', {
+        class: `dummy-tab-panel${active ? ' active' : ''}`,
+        role: 'tabpanel',
+        'data-panel': id,
+        hidden: active ? undefined : 'hidden',
+    }, children);
+}
+
+function bindTabs(root) {
+    const tabs = root.querySelectorAll('.dummy-tab');
+    const panels = root.querySelectorAll('.dummy-tab-panel');
+    tabs.forEach((tab) => {
+        tab.addEventListener('click', () => {
+            const name = tab.dataset.tab;
+            tabs.forEach((t) => {
+                const on = t.dataset.tab === name;
+                t.classList.toggle('active', on);
+                t.setAttribute('aria-selected', on ? 'true' : 'false');
+            });
+            panels.forEach((p) => {
+                const on = p.dataset.panel === name;
+                p.classList.toggle('active', on);
+                if (on) p.removeAttribute('hidden');
+                else p.setAttribute('hidden', 'hidden');
+            });
+        });
+    });
 }
 
 async function mountUI() {
@@ -373,115 +456,149 @@ async function mountUI() {
     const wrap = el('div', { id: 'dummy_root', class: 'dummy-scope' });
     wrap.appendChild(
         el('div', { class: 'inline-drawer dummy-drawer' }, [
-            el('div', { class: 'inline-drawer-toggle inline-drawer-header' }, [
-                el('b', { text: `Dummy — 空回重刷 / 截断续写（v${EXT_VERSION}）` }),
+            el('div', { class: 'inline-drawer-toggle inline-drawer-header dummy-drawer-head' }, [
+                el('div', { class: 'dummy-head-title' }, [
+                    el('b', { text: 'Dummy' }),
+                    el('span', { class: 'dummy-badge', text: `v${EXT_VERSION}` }),
+                ]),
                 el('div', { class: 'inline-drawer-icon fa-solid fa-circle-chevron-down down' }),
             ]),
-            el('div', { class: 'inline-drawer-content' }, [
-                el('div', { class: 'dummy-version-row' }, [
-                    el('span', { class: 'dummy-version-label', text: `当前版本 v${EXT_VERSION}` }),
-                    (() => {
-                        const btn = el('button', {
-                            class: 'menu_button dummy-update-btn',
-                            type: 'button',
-                            id: 'dummy_check_update',
-                        });
-                        btn.textContent = '检查更新';
-                        return btn;
-                    })(),
+            el('div', { class: 'inline-drawer-content dummy-panel' }, [
+                tabBar([
+                    { id: 'overview', label: '总览', icon: 'fa-gauge-high' },
+                    { id: 'regen', label: '空回', icon: 'fa-rotate-right' },
+                    { id: 'continue', label: '续写', icon: 'fa-scissors' },
+                    { id: 'update', label: '更新', icon: 'fa-cloud-arrow-down' },
                 ]),
-                el('div', { class: 'dummy-update-status', id: 'dummy_update_status', text: '尚未检查更新' }),
-                labeledCheck('后台定期检查更新', settings.updateCheckEnabled, (v) => {
-                    settings.updateCheckEnabled = v;
-                    save();
-                    restartBackgroundUpdateChecker(context, settings, save, updateUpdateStatus);
-                }),
-                el('div', { class: 'dummy-grid' }, [
-                    labeledNumber('检查间隔（分钟）', 'dummy_update_iv', settings.updateCheckIntervalMinutes, 15, 10080, (v) => {
-                        settings.updateCheckIntervalMinutes = v;
-                        save();
-                        restartBackgroundUpdateChecker(context, settings, save, updateUpdateStatus);
-                    }),
+                tabPanel('overview', true, [
+                    el('p', { class: 'dummy-lead', text: '自动处理空回复与截断回复，无需手动点重刷或续写。' }),
+                    featureToggleCard(
+                        'fa-rotate-right',
+                        '空回自动重刷',
+                        '回复过短时执行 /regenerate',
+                        settings.enabled,
+                        (v) => { settings.enabled = v; save(); },
+                    ),
+                    featureToggleCard(
+                        'fa-scissors',
+                        '截断自动续写',
+                        '检测到截断或未收束时执行 /continue',
+                        settings.continueEnabled,
+                        (v) => { settings.continueEnabled = v; save(); },
+                    ),
+                    el('div', { class: 'dummy-status-bar' }, [
+                        el('i', { class: 'fa-solid fa-circle-dot dummy-status-dot' }),
+                        el('span', { class: 'dummy-status', id: 'dummy_status', text: '就绪' }),
+                    ]),
                 ]),
-                labeledCheck('发现更新后自动安装', settings.updateAutoInstall, (v) => {
-                    settings.updateAutoInstall = v;
-                    save();
-                }),
-                labeledCheck('安装后自动刷新页面', settings.updateAutoReload, (v) => {
-                    settings.updateAutoReload = v;
-                    save();
-                }),
-                el('hr'),
-                el('p', {
-                    class: 'dummy-hint',
-                    text: '空回时自动 /regenerate；检测到 API 截断（如 length、content_filter）或回复未正常收束时自动 /continue。续写无增量时会继续尝试，均有次数上限。',
-                }),
-                labeledCheck('启用空回自动重刷', settings.enabled, (v) => {
-                    settings.enabled = v;
-                    save();
-                }),
-                el('div', { class: 'dummy-grid' }, [
-                    labeledNumber('空回最多重试', 'dummy_max', settings.maxRetries, 1, 10, (v) => {
-                        settings.maxRetries = v;
-                        save();
-                    }),
-                    labeledNumber('解锁后缓冲（毫秒）', 'dummy_settle', settings.unlockSettleMs, 0, 5000, (v) => {
-                        settings.unlockSettleMs = v;
-                        save();
-                    }),
-                    labeledNumber('空回额外延迟（毫秒）', 'dummy_delay', settings.delayMs, 0, 30000, (v) => {
-                        settings.delayMs = v;
-                        save();
-                    }),
-                    labeledNumber('最短有效字符数', 'dummy_min', settings.minChars, 1, 500, (v) => {
-                        settings.minChars = v;
-                        save();
-                    }),
+                tabPanel('regen', false, [
+                    sectionCard('重试参数', 'fa-sliders', [
+                        el('div', { class: 'dummy-grid' }, [
+                            labeledNumber('最多重试', 'dummy_max', settings.maxRetries, 1, 10, (v) => {
+                                settings.maxRetries = v;
+                                save();
+                            }, '空回触发后最多尝试几次 /regenerate'),
+                            labeledNumber('解锁缓冲 (ms)', 'dummy_settle', settings.unlockSettleMs, 0, 5000, (v) => {
+                                settings.unlockSettleMs = v;
+                                save();
+                            }, '等待生成解锁后再操作的毫秒数'),
+                            labeledNumber('额外延迟 (ms)', 'dummy_delay', settings.delayMs, 0, 30000, (v) => {
+                                settings.delayMs = v;
+                                save();
+                            }),
+                            labeledNumber('最短有效字数', 'dummy_min', settings.minChars, 1, 500, (v) => {
+                                settings.minChars = v;
+                                save();
+                            }, '低于此字数视为空回'),
+                        ]),
+                    ]),
+                    sectionCard('其他', 'fa-gear', [
+                        labeledCheck('达上限时弹出提示', settings.showToast, (v) => {
+                            settings.showToast = v;
+                            save();
+                        }),
+                        labeledCheck('判断前剥除 HTML', settings.stripHtml, (v) => {
+                            settings.stripHtml = v;
+                            save();
+                        }),
+                    ]),
                 ]),
-                el('hr'),
-                labeledCheck('启用截断自动续写', settings.continueEnabled, (v) => {
-                    settings.continueEnabled = v;
-                    save();
-                }),
-                el('div', { class: 'dummy-grid' }, [
-                    labeledNumber('截断最多续写', 'dummy_cmax', settings.maxContinueRetries, 1, 15, (v) => {
-                        settings.maxContinueRetries = v;
-                        save();
-                    }),
-                    labeledNumber('续写前延迟（毫秒）', 'dummy_cdelay', settings.continueDelayMs, 0, 30000, (v) => {
-                        settings.continueDelayMs = v;
-                        save();
-                    }),
-                    labeledNumber('续写最短已有字数', 'dummy_cmin', settings.minCharsToContinue, 1, 500, (v) => {
-                        settings.minCharsToContinue = v;
-                        save();
-                    }),
-                    labeledNumber('启发式最短字数', 'dummy_imin', settings.minIncompleteChars, 10, 2000, (v) => {
-                        settings.minIncompleteChars = v;
-                        save();
-                    }),
+                tabPanel('continue', false, [
+                    sectionCard('续写参数', 'fa-sliders', [
+                        el('div', { class: 'dummy-grid' }, [
+                            labeledNumber('最多续写', 'dummy_cmax', settings.maxContinueRetries, 1, 15, (v) => {
+                                settings.maxContinueRetries = v;
+                                save();
+                            }),
+                            labeledNumber('续写延迟 (ms)', 'dummy_cdelay', settings.continueDelayMs, 0, 30000, (v) => {
+                                settings.continueDelayMs = v;
+                                save();
+                            }),
+                            labeledNumber('最短已有字数', 'dummy_cmin', settings.minCharsToContinue, 1, 500, (v) => {
+                                settings.minCharsToContinue = v;
+                                save();
+                            }),
+                            labeledNumber('启发式最短字数', 'dummy_imin', settings.minIncompleteChars, 10, 2000, (v) => {
+                                settings.minIncompleteChars = v;
+                                save();
+                            }, '未收束检测仅对足够长的回复生效'),
+                        ]),
+                    ]),
+                    sectionCard('触发条件', 'fa-bolt', [
+                        labeledCheck('length / max_tokens 截断', settings.continueOnLength, (v) => {
+                            settings.continueOnLength = v;
+                            save();
+                        }, 'API finish_reason 为 length 等'),
+                        labeledCheck('内容审查 / safety 截断', settings.continueOnContentFilter, (v) => {
+                            settings.continueOnContentFilter = v;
+                            save();
+                        }),
+                        labeledCheck('回复未正常收束', settings.continueOnIncomplete, (v) => {
+                            settings.continueOnIncomplete = v;
+                            save();
+                        }, '缺少句号、引号闭合等启发式判断'),
+                    ]),
                 ]),
-                labeledCheck('API finish_reason = length / max_tokens 时续写', settings.continueOnLength, (v) => {
-                    settings.continueOnLength = v;
-                    save();
-                }),
-                labeledCheck('API 内容审查 / safety 截断时续写', settings.continueOnContentFilter, (v) => {
-                    settings.continueOnContentFilter = v;
-                    save();
-                }),
-                labeledCheck('回复未正常收束（缺句号等）时续写', settings.continueOnIncomplete, (v) => {
-                    settings.continueOnIncomplete = v;
-                    save();
-                }),
-                labeledCheck('达上限时显示提示（toastr）', settings.showToast, (v) => {
-                    settings.showToast = v;
-                    save();
-                }),
-                labeledCheck('判断前剥除 HTML 标签', settings.stripHtml, (v) => {
-                    settings.stripHtml = v;
-                    save();
-                }),
-                el('div', { class: 'dummy-status', id: 'dummy_status', text: '就绪' }),
+                tabPanel('update', false, [
+                    el('div', { class: 'dummy-update-hero' }, [
+                        el('div', { class: 'dummy-update-version' }, [
+                            el('span', { class: 'dummy-update-label', text: '当前版本' }),
+                            el('span', { class: 'dummy-badge dummy-badge-lg', text: `v${EXT_VERSION}` }),
+                        ]),
+                        (() => {
+                            const btn = el('button', {
+                                class: 'menu_button dummy-update-btn',
+                                type: 'button',
+                                id: 'dummy_check_update',
+                            });
+                            btn.innerHTML = '<i class="fa-solid fa-arrows-rotate"></i> 检查更新';
+                            return btn;
+                        })(),
+                    ]),
+                    el('div', { class: 'dummy-update-status', id: 'dummy_update_status', text: '尚未检查更新' }),
+                    sectionCard('自动更新', 'fa-clock', [
+                        labeledCheck('后台定期检查', settings.updateCheckEnabled, (v) => {
+                            settings.updateCheckEnabled = v;
+                            save();
+                            restartBackgroundUpdateChecker(context, settings, save, updateUpdateStatus);
+                        }),
+                        el('div', { class: 'dummy-grid dummy-grid-single' }, [
+                            labeledNumber('检查间隔 (分钟)', 'dummy_update_iv', settings.updateCheckIntervalMinutes, 15, 10080, (v) => {
+                                settings.updateCheckIntervalMinutes = v;
+                                save();
+                                restartBackgroundUpdateChecker(context, settings, save, updateUpdateStatus);
+                            }),
+                        ]),
+                        labeledCheck('发现更新后自动安装', settings.updateAutoInstall, (v) => {
+                            settings.updateAutoInstall = v;
+                            save();
+                        }),
+                        labeledCheck('安装后自动刷新页面', settings.updateAutoReload, (v) => {
+                            settings.updateAutoReload = v;
+                            save();
+                        }),
+                    ]),
+                ]),
             ]),
         ]),
     );
@@ -493,6 +610,8 @@ async function mountUI() {
     $(wrap).find('.inline-drawer-toggle').on('click', function () {
         $(this).closest('.inline-drawer').toggleClass('open');
     });
+
+    bindTabs(wrap);
 
     const updateBtn = wrap.querySelector('#dummy_check_update');
     updateBtn?.addEventListener('click', async () => {
