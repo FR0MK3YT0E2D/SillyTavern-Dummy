@@ -3,6 +3,11 @@ import {
     getLastGenerationMeta,
     installGenerationHook,
 } from './generation-hook.js';
+import {
+    EXT_VERSION,
+    checkAndUpdateExtension,
+    restartBackgroundUpdateChecker,
+} from './update.js';
 
 const MODULE_NAME = 'Dummy';
 
@@ -22,6 +27,11 @@ const defaultSettings = Object.freeze({
     continueOnContentFilter: true,
     continueOnIncomplete: true,
     minIncompleteChars: 40,
+    updateCheckEnabled: true,
+    updateCheckIntervalMinutes: 360,
+    updateAutoInstall: true,
+    updateAutoReload: true,
+    lastUpdateCheckAt: 0,
 });
 
 /** @type {number} */
@@ -111,6 +121,11 @@ function notify(settings, message, severity = 'warning') {
 function updateStatus(text) {
     const statusEl = document.getElementById('dummy_status');
     if (statusEl) statusEl.textContent = text;
+}
+
+function updateUpdateStatus(text) {
+    const el = document.getElementById('dummy_update_status');
+    if (el) el.textContent = text;
 }
 
 /**
@@ -359,10 +374,44 @@ async function mountUI() {
     wrap.appendChild(
         el('div', { class: 'inline-drawer dummy-drawer' }, [
             el('div', { class: 'inline-drawer-toggle inline-drawer-header' }, [
-                el('b', { text: 'Dummy — 空回重刷 / 截断续写' }),
+                el('b', { text: `Dummy — 空回重刷 / 截断续写（v${EXT_VERSION}）` }),
                 el('div', { class: 'inline-drawer-icon fa-solid fa-circle-chevron-down down' }),
             ]),
             el('div', { class: 'inline-drawer-content' }, [
+                el('div', { class: 'dummy-version-row' }, [
+                    el('span', { class: 'dummy-version-label', text: `当前版本 v${EXT_VERSION}` }),
+                    (() => {
+                        const btn = el('button', {
+                            class: 'menu_button dummy-update-btn',
+                            type: 'button',
+                            id: 'dummy_check_update',
+                        });
+                        btn.textContent = '检查更新';
+                        return btn;
+                    })(),
+                ]),
+                el('div', { class: 'dummy-update-status', id: 'dummy_update_status', text: '尚未检查更新' }),
+                labeledCheck('后台定期检查更新', settings.updateCheckEnabled, (v) => {
+                    settings.updateCheckEnabled = v;
+                    save();
+                    restartBackgroundUpdateChecker(context, settings, save, updateUpdateStatus);
+                }),
+                el('div', { class: 'dummy-grid' }, [
+                    labeledNumber('检查间隔（分钟）', 'dummy_update_iv', settings.updateCheckIntervalMinutes, 15, 10080, (v) => {
+                        settings.updateCheckIntervalMinutes = v;
+                        save();
+                        restartBackgroundUpdateChecker(context, settings, save, updateUpdateStatus);
+                    }),
+                ]),
+                labeledCheck('发现更新后自动安装', settings.updateAutoInstall, (v) => {
+                    settings.updateAutoInstall = v;
+                    save();
+                }),
+                labeledCheck('安装后自动刷新页面', settings.updateAutoReload, (v) => {
+                    settings.updateAutoReload = v;
+                    save();
+                }),
+                el('hr'),
                 el('p', {
                     class: 'dummy-hint',
                     text: '空回时自动 /regenerate；检测到 API 截断（如 length、content_filter）或回复未正常收束时自动 /continue。续写无增量时会继续尝试，均有次数上限。',
@@ -444,6 +493,18 @@ async function mountUI() {
     $(wrap).find('.inline-drawer-toggle').on('click', function () {
         $(this).closest('.inline-drawer').toggleClass('open');
     });
+
+    const updateBtn = wrap.querySelector('#dummy_check_update');
+    updateBtn?.addEventListener('click', async () => {
+        updateBtn.disabled = true;
+        try {
+            await checkAndUpdateExtension(context, settings, save, updateUpdateStatus, { manual: true });
+        } finally {
+            updateBtn.disabled = false;
+        }
+    });
+
+    restartBackgroundUpdateChecker(context, settings, save, updateUpdateStatus);
 }
 
 export async function onActivate() {

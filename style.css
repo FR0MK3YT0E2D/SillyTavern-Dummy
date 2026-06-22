@@ -23,6 +23,30 @@
     margin: 6px 0;
 }
 
+.dummy-scope .dummy-version-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 6px;
+}
+
+.dummy-scope .dummy-version-label {
+    font-size: 0.95em;
+    opacity: 0.9;
+}
+
+.dummy-scope .dummy-update-btn {
+    min-width: 6em;
+}
+
+.dummy-scope .dummy-update-status {
+    font-size: 0.9em;
+    margin-bottom: 8px;
+    opacity: 0.85;
+    min-height: 1.2em;
+}
+
 .dummy-scope .dummy-status {
     font-size: 0.95em;
     margin-top: 8px;
