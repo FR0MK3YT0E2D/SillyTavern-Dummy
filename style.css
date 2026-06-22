@@ -276,6 +276,14 @@
 
 /* ── status bar ──────────────────────────────────────────── */
 
+.dummy-scope .dummy-field-wide .dummy-textarea {
+    width: 100%;
+    min-height: 4.5em;
+    resize: vertical;
+    font-family: monospace;
+    font-size: 0.88em;
+}
+
 .dummy-scope .dummy-status-bar {
     display: flex;
     align-items: center;

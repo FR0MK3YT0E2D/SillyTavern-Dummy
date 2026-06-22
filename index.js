@@ -4,12 +4,29 @@ import {
     installGenerationHook,
 } from './generation-hook.js';
 import {
+    acquireRetryLock,
+    externalWouldHandleShortReply,
+    releaseRetryLock,
+} from './retry-coordinator.js';
+import {
+    bindStreamRetryEvents,
+    checkApiRequestTail,
+    handleNoTokenGenerationEnded,
+    initStreamRetry,
+    isDryRunGeneration,
+    isSwipeGenerationContext,
+    resetStreamState,
+    shouldSkipMessageForRetry,
+    wasUserStopped,
+} from './stream-retry.js';
+import {
     EXT_VERSION,
     checkAndUpdateExtension,
     restartBackgroundUpdateChecker,
 } from './update.js';
 
 const MODULE_NAME = 'Dummy';
+const RETRY_LOCK_OWNER = 'dummy';
 
 const defaultSettings = Object.freeze({
     enabled: true,
@@ -27,6 +44,14 @@ const defaultSettings = Object.freeze({
     continueOnContentFilter: true,
     continueOnIncomplete: true,
     minIncompleteChars: 40,
+    streamRetryEnabled: true,
+    requestTimeoutMs: 360000,
+    streamRetryDelayMs: 600,
+    noTokenCheckDelayMs: 300,
+    skipUpdateVariableTag: true,
+    apiTailEnabled: false,
+    apiTailPattern: '',
+    coexistAutoRetry: true,
     updateCheckEnabled: true,
     updateCheckIntervalMinutes: 360,
     updateAutoInstall: true,
@@ -192,13 +217,72 @@ function resetCounters() {
     pendingAction = null;
 }
 
-async function runSlash(context, command, settings, settleMs, extraMs) {
+async function runSlash(context, command, settings, settleMs, extraMs, { forceRegenerate = false } = {}) {
     await waitForGenerationUnlock();
     await delay(settleMs);
     if (extraMs > 0) await delay(extraMs);
-    if (!settings.enabled && command.includes('regenerate')) return;
+    if (!forceRegenerate && !settings.enabled && command.includes('regenerate')) return;
     if (!settings.continueEnabled && command.includes('continue')) return;
     await context.executeSlashCommandsWithOptions(command, { forceChatTrigger: false });
+}
+
+/**
+ * @param {ReturnType<typeof getContext>} context
+ * @param {ReturnType<typeof getSettings>['settings']} settings
+ * @param {string} reason
+ * @param {{ kind?: 'empty' | 'stream' }} [opts]
+ */
+async function runRegenerate(context, settings, reason, opts = {}) {
+    const kind = opts.kind || 'empty';
+    if (kind === 'stream' && !settings.streamRetryEnabled) return false;
+    if (kind === 'empty' && !settings.enabled) return false;
+    if (isSwipeGenerationContext() || isDryRunGeneration() || wasUserStopped()) return false;
+    if (!checkApiRequestTail(settings)) return false;
+    if (!acquireRetryLock(RETRY_LOCK_OWNER)) return false;
+
+    if (consecutiveRetries >= settings.maxRetries) {
+        notify(settings, `重试已达上限（${settings.maxRetries} 次），请手动重刷或检查 API。`);
+        updateStatus(`已停止：连续重试 ${settings.maxRetries} 次`);
+        consecutiveRetries = 0;
+        pendingAction = null;
+        releaseRetryLock(RETRY_LOCK_OWNER);
+        return false;
+    }
+
+    retryInFlight = true;
+    consecutiveRetries += 1;
+    consecutiveContinueRetries = 0;
+    const attempt = consecutiveRetries;
+    const settleMs = Math.max(0, Number(settings.unlockSettleMs) || 0);
+    const extraMs = Math.max(0, Number(kind === 'stream' ? settings.streamRetryDelayMs : settings.delayMs) || 0);
+    const label = kind === 'stream' ? '断流' : '空回';
+
+    updateStatus(`${reason}，${settleMs + extraMs}ms 后自动重刷（${attempt}/${settings.maxRetries}）…`);
+    if (settings.showToast) {
+        notify(settings, `🔄 ${reason}，自动重刷 ${attempt}/${settings.maxRetries}`);
+    }
+
+    const last = getLastCharacterMessage(context.chat);
+    const baselineLength = last ? getMessageText(last.message, settings).length : 0;
+    pendingAction = {
+        type: 'regenerate',
+        baselineLength,
+        messageIndex: last?.index ?? -1,
+    };
+
+    try {
+        await runSlash(context, '/regenerate await=true', settings, settleMs, extraMs, { forceRegenerate: true });
+        return true;
+    } catch (err) {
+        console.error(`[${MODULE_NAME}] regenerate failed`, err);
+        notify(settings, `自动重刷失败：${err?.message || err}`, 'error');
+        updateStatus(`错误：${err?.message || err}`);
+        resetCounters();
+        return false;
+    } finally {
+        retryInFlight = false;
+        releaseRetryLock(RETRY_LOCK_OWNER);
+    }
 }
 
 async function onGenerationEnded() {
@@ -208,14 +292,30 @@ async function onGenerationEnded() {
 
     const { settings } = getSettings(context);
     const last = getLastCharacterMessage(context.chat);
-    if (!last) return;
+    if (!last) {
+        if (settings.streamRetryEnabled) {
+            await handleNoTokenGenerationEnded(context);
+        }
+        return;
+    }
 
     const text = getMessageText(last.message, settings);
     const settleMs = Math.max(0, Number(settings.unlockSettleMs) || 0);
 
+    if (pendingAction?.type === 'regenerate' && pendingAction.messageIndex === -1 && last) {
+        pendingAction.messageIndex = last.index;
+        pendingAction.baselineLength = text.length;
+    }
+
     if (pendingAction && pendingAction.messageIndex === last.index) {
         const grew = text.length > pendingAction.baselineLength;
-        if (grew && text.length >= settings.minChars) {
+        if (pendingAction.type === 'regenerate' && grew && text.length >= settings.minChars) {
+            consecutiveRetries = 0;
+            pendingAction = null;
+            updateStatus('就绪');
+            return;
+        }
+        if (pendingAction.type === 'continue' && grew && text.length >= settings.minChars) {
             const stillTruncated = isTruncatedResponse(text, settings);
             if (!stillTruncated.truncated) {
                 resetCounters();
@@ -225,35 +325,21 @@ async function onGenerationEnded() {
         }
     }
 
+    if (settings.streamRetryEnabled) {
+        const noTokenHandled = await handleNoTokenGenerationEnded(context);
+        if (noTokenHandled) return;
+    }
+
     if (text.length < settings.minChars) {
         consecutiveContinueRetries = 0;
         if (!settings.enabled) return;
+        if (isSwipeGenerationContext() || isDryRunGeneration() || wasUserStopped()) return;
+        if (shouldSkipMessageForRetry(text, settings)) return;
+        if (!checkApiRequestTail(settings)) return;
+        if (externalWouldHandleShortReply(settings, text.length)) return;
 
-        if (consecutiveRetries >= settings.maxRetries) {
-            notify(settings, `空回已达重试上限（${settings.maxRetries} 次），请手动重刷或检查 API。`);
-            updateStatus(`已停止：连续空回 ${settings.maxRetries} 次`);
-            consecutiveRetries = 0;
-            pendingAction = null;
-            return;
-        }
-
-        retryInFlight = true;
-        consecutiveRetries += 1;
-        const attempt = consecutiveRetries;
-        const extraMs = Math.max(0, Number(settings.delayMs) || 0);
-        updateStatus(`检测到空回，解锁后 ${settleMs + extraMs}ms 自动重刷（${attempt}/${settings.maxRetries}）…`);
         pendingAction = { type: 'regenerate', baselineLength: text.length, messageIndex: last.index };
-
-        try {
-            await runSlash(context, '/regenerate await=true', settings, settleMs, extraMs);
-        } catch (err) {
-            console.error(`[${MODULE_NAME}] regenerate failed`, err);
-            notify(settings, `自动重刷失败：${err?.message || err}`, 'error');
-            updateStatus(`错误：${err?.message || err}`);
-            resetCounters();
-        } finally {
-            retryInFlight = false;
-        }
+        await runRegenerate(context, settings, '检测到空回', { kind: 'empty' });
         return;
     }
 
@@ -320,15 +406,42 @@ function bindListeners() {
 
     const { eventSource, eventTypes } = context;
 
+    initStreamRetry({
+        getSettings: () => getSettings(context).settings,
+        runRegenerate: (reason, opts) => runRegenerate(context, getSettings(context).settings, reason, opts),
+        isRetryInFlight: () => retryInFlight,
+        setRetryInFlight: (v) => { retryInFlight = v; },
+        updateStatus,
+        notify: (message, severity) => notify(getSettings(context).settings, message, severity),
+    });
+    bindStreamRetryEvents(context);
+
     eventSource.on(eventTypes.GENERATION_ENDED, onGenerationEnded);
     eventSource.on(eventTypes.CHAT_CHANGED, () => {
         resetCounters();
         retryInFlight = false;
+        resetStreamState();
         clearLastGenerationMeta();
+        releaseRetryLock(RETRY_LOCK_OWNER);
         updateStatus('就绪');
     });
 
     listenersBound = true;
+}
+
+function labeledTextarea(label, id, initial, rows, onChange, hint = '') {
+    const input = el('textarea', {
+        class: 'text_pole dummy-textarea',
+        id,
+        rows: String(rows),
+    });
+    input.value = initial;
+    input.addEventListener('change', () => onChange(input.value));
+    const labelRow = el('label', {}, [document.createTextNode(label)]);
+    if (hint) {
+        labelRow.appendChild(el('span', { class: 'dummy-hint-icon fa-solid fa-circle-info', title: hint }));
+    }
+    return el('div', { class: 'dummy-field dummy-field-wide' }, [labelRow, input]);
 }
 
 function labeledNumber(label, id, initial, min, max, onChange, hint = '') {
@@ -467,17 +580,25 @@ async function mountUI() {
                 tabBar([
                     { id: 'overview', label: '总览', icon: 'fa-gauge-high' },
                     { id: 'regen', label: '空回', icon: 'fa-rotate-right' },
+                    { id: 'stream', label: '断流', icon: 'fa-plug-circle-xmark' },
                     { id: 'continue', label: '续写', icon: 'fa-scissors' },
                     { id: 'update', label: '更新', icon: 'fa-cloud-arrow-down' },
                 ]),
                 tabPanel('overview', true, [
-                    el('p', { class: 'dummy-lead', text: '自动处理空回复与截断回复，无需手动点重刷或续写。' }),
+                    el('p', { class: 'dummy-lead', text: '自动处理空回复、断流超时与截断回复。' }),
                     featureToggleCard(
                         'fa-rotate-right',
                         '空回自动重刷',
                         '回复过短时执行 /regenerate',
                         settings.enabled,
                         (v) => { settings.enabled = v; save(); },
+                    ),
+                    featureToggleCard(
+                        'fa-plug-circle-xmark',
+                        '断流自动重试',
+                        '无回复或生成超时时自动重刷',
+                        settings.streamRetryEnabled,
+                        (v) => { settings.streamRetryEnabled = v; save(); },
                     ),
                     featureToggleCard(
                         'fa-scissors',
@@ -521,6 +642,42 @@ async function mountUI() {
                             settings.stripHtml = v;
                             save();
                         }),
+                    ]),
+                ]),
+                tabPanel('stream', false, [
+                    sectionCard('断流重试', 'fa-hourglass-half', [
+                        el('div', { class: 'dummy-grid' }, [
+                            labeledNumber('生成超时 (ms)', 'dummy_timeout', settings.requestTimeoutMs, 0, 3600000, (v) => {
+                                settings.requestTimeoutMs = v;
+                                save();
+                            }, '0 表示禁用；默认 360000（6 分钟）'),
+                            labeledNumber('重试延迟 (ms)', 'dummy_sdelay', settings.streamRetryDelayMs, 0, 30000, (v) => {
+                                settings.streamRetryDelayMs = v;
+                                save();
+                            }),
+                            labeledNumber('无回复确认 (ms)', 'dummy_ndelay', settings.noTokenCheckDelayMs, 0, 5000, (v) => {
+                                settings.noTokenCheckDelayMs = v;
+                                save();
+                            }, '生成结束后等待多久再判定为无回复'),
+                        ]),
+                    ]),
+                    sectionCard('条件过滤', 'fa-filter', [
+                        labeledCheck('跳过含 <UpdateVariable> 的回复', settings.skipUpdateVariableTag, (v) => {
+                            settings.skipUpdateVariableTag = v;
+                            save();
+                        }, '避免误重刷 MVU 变量更新楼层'),
+                        labeledCheck('启用 API 请求末尾检测', settings.apiTailEnabled, (v) => {
+                            settings.apiTailEnabled = v;
+                            save();
+                        }, '仅当发往 API 的 prompt 末尾匹配时才自动重刷'),
+                        labeledTextarea('末尾匹配文本', 'dummy_tail', settings.apiTailPattern, 3, (v) => {
+                            settings.apiTailPattern = v;
+                            save();
+                        }, '忽略空白差异；不匹配时本次生成不触发重刷'),
+                        labeledCheck('兼容其他自动重试脚本', settings.coexistAutoRetry, (v) => {
+                            settings.coexistAutoRetry = v;
+                            save();
+                        }, '检测到酒馆助手脚本已开启时，避免重复重刷'),
                     ]),
                 ]),
                 tabPanel('continue', false, [

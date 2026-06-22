@@ -1,5 +1,5 @@
 /** 与 manifest.json version 保持同步 */
-export const EXT_VERSION = '1.2.2';
+export const EXT_VERSION = '1.3.0';
 
 /** @type {number | null} */
 let backgroundTimer = null;
