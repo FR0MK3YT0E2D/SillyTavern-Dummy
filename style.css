@@ -1,0 +1,35 @@
+.dummy-scope .dummy-hint {
+    opacity: 0.9;
+    margin: 0.5em 0 1em;
+    line-height: 1.45;
+}
+
+.dummy-scope .dummy-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+    gap: 10px;
+    margin-bottom: 10px;
+}
+
+.dummy-scope .dummy-field label {
+    display: block;
+    margin-bottom: 4px;
+}
+
+.dummy-scope .dummy-check {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 6px 0;
+}
+
+.dummy-scope .dummy-status {
+    font-size: 0.95em;
+    margin-top: 8px;
+    min-height: 1.2em;
+    opacity: 0.85;
+}
+
+.dummy-scope .dummy-drawer .inline-drawer-content {
+    padding: 10px 0 6px;
+}
